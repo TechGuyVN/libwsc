@@ -235,7 +235,7 @@ void WebSocketClient::connect() {
  * - Finally, sets state to DISCONNECTED and notifies waiters again.
  */
 void WebSocketClient::disconnect() {
-    log_debug("disconnect: entering");
+    log_debug("VIETHQ version 1.1 WebSocketClient disconnect: entering");
 
     auto current_state = connection_state.load(std::memory_order_acquire);
     if (current_state == ConnectionState::DISCONNECTING || current_state == ConnectionState::DISCONNECTED) {
@@ -298,10 +298,21 @@ void WebSocketClient::disconnect() {
         }
 
         if (self->event_thread && self->event_thread->joinable()) {
-          self->event_thread->join();
+          try {
+            self->event_thread->join();
+          } catch (const std::system_error& e) {
+            log_error("VietHQ System error joining event thread in helper: %s (code: %d)", e.what(), e.code().value());
+          } catch (const std::exception& e) {
+            log_error("VietHQ version 1.1 Exception joining event thread in helper: %s", e.what());
+          } catch (...) {
+            log_error("VietHQ Unknown exception joining event thread in helper");
+          }
         }
-        delete self->event_thread;
-        self->event_thread = nullptr;
+        
+        if (self->event_thread) {
+          delete self->event_thread;
+          self->event_thread = nullptr;
+        }
 
         self->cleanup();
 
@@ -316,12 +327,22 @@ void WebSocketClient::disconnect() {
     // Otherwise—called from a non‐event thread—do the normal join+cleanup
     if (event_thread && event_thread->joinable() ) {
       log_debug("Waiting for event thread to join...");
-      event_thread->join();
-      log_debug("Event thread joined");
+      try {
+        event_thread->join();
+        log_debug("Event thread joined");
+      } catch (const std::system_error& e) {
+        log_error("System error joining event thread: %s (code: %d)", e.what(), e.code().value());
+      } catch (const std::exception& e) {
+        log_error("Exception joining event thread: %s", e.what());
+      } catch (...) {
+        log_error("Unknown exception joining event thread");
+      }
     }
 
-    delete event_thread;
-    event_thread = nullptr;
+    if (event_thread) {
+      delete event_thread;
+      event_thread = nullptr;
+    }
 
     cleanup();
 
