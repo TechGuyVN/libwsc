@@ -255,6 +255,17 @@ void WebSocketClient::disconnect() {
     }
 
     if (base && running.load()) {
+        // Cancel timeout and ping events first to prevent callbacks from being called
+        // This must be done before loopexit to ensure events are removed from event_base
+        if (timeout_event) {
+            event_del(timeout_event);
+            log_debug("Cancelled timeout event");
+        }
+        if (ping_event) {
+            event_del(ping_event);
+            log_debug("Cancelled ping event");
+        }
+        
         bufferevent_lock(m_bev);
         bufferevent_disable(m_bev, EV_READ | EV_WRITE);
         // schedule a zero-timeout no-op so the loop definitely wakes
@@ -468,14 +479,32 @@ void WebSocketClient::setOpenCallback(OpenCallback callback) {
 
 // Invoke the error callback (or log if none set)
 void WebSocketClient::sendError(int error_code, const std::string& error_message) {
+    // Check if object is being destroyed to prevent use-after-free
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("sendError: object is being destroyed, ignoring error: %s", error_message.c_str());
+        return;
+    }
+
     ErrorCallback callback;
-    {
+    try {
         std::lock_guard<std::mutex> lock(callback_mutex);
         callback = error_callback;
+    } catch (const std::exception& e) {
+        log_error("Exception locking callback_mutex in sendError: %s", e.what());
+        return;
+    } catch (...) {
+        log_error("Unknown exception locking callback_mutex in sendError");
+        return;
     }
 
     if (callback) {
-        callback(error_code, error_message);
+        try {
+            callback(error_code, error_message);
+        } catch (const std::exception& e) {
+            log_error("Exception in error callback: %s", e.what());
+        } catch (...) {
+            log_error("Unknown exception in error callback");
+        }
     } else {
         log_error("Unhandled error: %s", error_message.c_str());
     }
@@ -1295,7 +1324,20 @@ void WebSocketClient::eventCallback(bufferevent* bev, short events, void* ctx) {
  */
 void WebSocketClient::pingCallback(evutil_socket_t /*fd*/, short /*event*/, void *arg) {
     WebSocketClient* client = static_cast<WebSocketClient*>(arg);
-    client->sendPing();
+    
+    // Check if object is being destroyed to prevent use-after-free
+    if (!client || client->cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("pingCallback: object is being destroyed, ignoring");
+        return;
+    }
+
+    try {
+        client->sendPing();
+    } catch (const std::exception& e) {
+        log_error("Exception in pingCallback: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in pingCallback");
+    }
 }
 
 /**
@@ -1303,11 +1345,25 @@ void WebSocketClient::pingCallback(evutil_socket_t /*fd*/, short /*event*/, void
  */
 void WebSocketClient::timeoutCallback(evutil_socket_t /*fd*/, short /*event*/, void *arg) {
     WebSocketClient* client = static_cast<WebSocketClient*>(arg);
+    
+    // Check if object is being destroyed to prevent use-after-free
+    if (!client || client->cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("timeoutCallback: object is being destroyed, ignoring");
+        return;
+    }
 
-    auto state = client->connection_state.load(std::memory_order_acquire);
-    if (state != ConnectionState::CONNECTED && state != ConnectionState::FAILED) {
-        //log_error("Connection timeout");
-        client->sendError(ErrorCode::CONNECT_FAILED, "Connection timeout");
+    try {
+        auto state = client->connection_state.load(std::memory_order_acquire);
+        if (state != ConnectionState::CONNECTED && state != ConnectionState::FAILED) {
+            // Double-check cleanup_complete before calling sendError
+            if (!client->cleanup_complete.load(std::memory_order_acquire)) {
+                client->sendError(ErrorCode::CONNECT_FAILED, "Connection timeout");
+            }
+        }
+    } catch (const std::exception& e) {
+        log_error("Exception in timeoutCallback: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in timeoutCallback");
     }
 }
 
