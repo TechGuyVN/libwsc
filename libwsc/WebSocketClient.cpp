@@ -235,7 +235,7 @@ void WebSocketClient::connect() {
  * - Finally, sets state to DISCONNECTED and notifies waiters again.
  */
 void WebSocketClient::disconnect() {
-    log_debug("VIETHQ version 1.1 WebSocketClient disconnect: entering");
+    log_info("VIETHQ version 1.1 WebSocketClient disconnect: entering");
 
     auto current_state = connection_state.load(std::memory_order_acquire);
     if (current_state == ConnectionState::DISCONNECTING || current_state == ConnectionState::DISCONNECTED) {
@@ -597,7 +597,7 @@ void WebSocketClient::sendError(int error_code, const std::string& error_message
     // CRITICAL: Check cleanup_complete FIRST before any operations
     // This prevents accessing destroyed mutex or callbacks
     if (cleanup_complete.load(std::memory_order_acquire)) {
-        log_debug("sendError: object is being destroyed, ignoring error: %s", error_message.c_str());
+        log_info("sendError: object is being destroyed, ignoring error: %s", error_message.c_str());
         return;
     }
 
@@ -728,7 +728,7 @@ void WebSocketClient::cleanup() {
     if (cleanup_complete.load()) return;
     cleanup_complete.store(true);
 
-    log_debug("cleanup: entered");
+    log_info("cleanup: entered");
 
     // Clean up events first
     if (ping_event) {
@@ -788,7 +788,7 @@ void WebSocketClient::cleanup() {
     upgraded.store(false);
     running.store(false);
 
-    log_debug("cleanup: exiting");
+    log_info("cleanup: exiting");
 }
 
 /**

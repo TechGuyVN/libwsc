@@ -90,12 +90,33 @@ inline void log_error_impl(const char* message) {
 #endif
 }
 
+/**
+ * \brief Internal info logger: writes to FreeSWITCH, stdout or syslog.
+ * Always enabled (not dependent on LIBWSC_USE_DEBUG).
+ */
+inline void log_info_impl(const char* message) {
+#if LIBWSC_USE_FREESWITCH_LOG
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "mod_audio_stream[libwsc]: %s\n", message);
+#else
+    char ts[32]; current_timestamp(ts, sizeof(ts));
+    if (logger_use_syslog()) {
+        syslog(LOG_INFO, "%s", message);
+    } else {
+        fprintf(stdout, "[INFO %s] %s\n", ts, message);
+        fflush(stdout);
+    }
+#endif
+}
+
 // Zero-arg overloads to avoid format-security warnings
 inline void log_debug_fmt_impl(const char* fmt) {
     log_debug_impl(fmt);
 }
 inline void log_error_fmt_impl(const char* fmt) {
     log_error_impl(fmt);
+}
+inline void log_info_fmt_impl(const char* fmt) {
+    log_info_impl(fmt);
 }
 
 // Templated overloads for formatting
@@ -113,6 +134,13 @@ inline void log_error_fmt_impl(const char* fmt, Args... args) {
     log_error_impl(buf);
 }
 
+template<typename... Args>
+inline void log_info_fmt_impl(const char* fmt, Args... args) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), fmt, args...);
+    log_info_impl(buf);
+}
+
 // Public macros
 #ifdef LIBWSC_USE_DEBUG
     #define log_debug(...)   log_debug_fmt_impl(__VA_ARGS__)
@@ -121,5 +149,6 @@ inline void log_error_fmt_impl(const char* fmt, Args... args) {
 #endif
 
 #define log_error(...)     log_error_fmt_impl(__VA_ARGS__)
+#define log_info(...)      log_info_fmt_impl(__VA_ARGS__)
 
 #endif // LOGGER_H
