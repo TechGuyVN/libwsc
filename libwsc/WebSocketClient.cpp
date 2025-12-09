@@ -1673,6 +1673,12 @@ void WebSocketClient::handleWrite(bufferevent* /*bev*/) {
  * 
  */
 void WebSocketClient::handleEvent(bufferevent* bev, short events) {
+    // Check if object is being destroyed FIRST - prevent all operations
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("handleEvent: object is being destroyed, ignoring events: %d", events);
+        return;
+    }
+    
     if (events & BEV_EVENT_CONNECTED) {
         log_debug("Connected to server");
 
@@ -1713,6 +1719,11 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
         sendHandshakeRequest();
 
     } else if (events & BEV_EVENT_ERROR) {
+        // Double-check cleanup_complete before processing error
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("handleEvent: object is being destroyed, ignoring BEV_EVENT_ERROR");
+            return;
+        }
         
         std::string message;
         ConnectionState new_state = ConnectionState::FAILED;
@@ -1724,7 +1735,10 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
                 ERR_error_string_n(ssl_err, err_buf, sizeof(err_buf));
                 log_error("TLS error: %.240s", err_buf);
                 message = err_buf;
-                sendError(ErrorCode::SSL_ERROR, message);
+                // sendError() will check cleanup_complete internally, but check here too
+                if (!cleanup_complete.load(std::memory_order_acquire)) {
+                    sendError(ErrorCode::SSL_ERROR, message);
+                }
                 connection_state.store(new_state, std::memory_order_release);
                 return;
             }
@@ -1737,11 +1751,22 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
             ? formatSocketError(error_code)
             : "Connection error";
         log_error("%s", message.c_str());
-        sendError(ErrorCode::IO, message);
+        
+        // Only send error if not being destroyed (Broken pipe after EOF is normal)
+        if (!cleanup_complete.load(std::memory_order_acquire)) {
+            sendError(ErrorCode::IO, message);
+        } else {
+            log_debug("handleEvent: ignoring error '%s' because object is being destroyed", message.c_str());
+        }
 
         connection_state.store(new_state, std::memory_order_release);
         
     } else if (events & BEV_EVENT_EOF) {
+        // Double-check cleanup_complete before processing EOF
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("handleEvent: object is being destroyed, ignoring BEV_EVENT_EOF");
+            return;
+        }
 
         std::string message;
         int close_code = static_cast<int>(CloseCode::NORMAL);
@@ -1759,8 +1784,14 @@ void WebSocketClient::handleEvent(bufferevent* bev, short events) {
             callback = close_callback;
         }
 
-        if (callback) {
-            callback(close_code, message.empty() ? "Connection closed" : message);
+        if (callback && !cleanup_complete.load(std::memory_order_acquire)) {
+            try {
+                callback(close_code, message.empty() ? "Connection closed" : message);
+            } catch (const std::exception& e) {
+                log_error("Exception in close callback: %s", e.what());
+            } catch (...) {
+                log_error("Unknown exception in close callback");
+            }
         }
 
     } else {
