@@ -288,6 +288,8 @@ bool WebSocketClientWrapper::sendData(const void* data, size_t length, MessageTy
 }
 
 bool WebSocketClientWrapper::close(int code, const std::string& reason) {
+    (void)code;   // Suppress unused parameter warning
+    (void)reason; // Suppress unused parameter warning
     if (!m_wsi) {
         return false;
     }
