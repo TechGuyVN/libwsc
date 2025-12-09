@@ -375,6 +375,12 @@ bool WebSocketClient::isConnected() {
 bool WebSocketClient::sendData(const void* data,
                                size_t length,
                                MessageType type) {
+    // Check if object is being destroyed FIRST
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("sendData: object is being destroyed, ignoring send request");
+        return false;
+    }
+
     if (!m_bev) {
         log_error("No bufferevent—cannot send");
         return false;
@@ -385,6 +391,11 @@ bool WebSocketClient::sendData(const void* data,
     // Queue
     if (state == ConnectionState::CONNECTING) {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
+        // Double-check cleanup_complete after acquiring lock
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("sendData: object is being destroyed (checked after queue lock), ignoring");
+            return false;
+        }
         if (send_queue.size() >= MAX_QUEUE_SIZE) {
             log_error("Send queue full—dropping packet");
             return false;
@@ -412,18 +423,58 @@ bool WebSocketClient::sendData(const void* data,
             log_error("WebSocket not fully upgraded yet");
             return false;
         }
-        bufferevent_lock(m_bev);
+        
+        // Wrap bufferevent operations in try-catch to handle destroyed bufferevent
+        try {
+            // Double-check cleanup_complete before locking bufferevent
+            if (cleanup_complete.load(std::memory_order_acquire)) {
+                log_debug("sendData: object is being destroyed (checked before lock), ignoring");
+                return false;
+            }
+            
+            bufferevent_lock(m_bev);
+            
+            // Check again after lock (bufferevent may have been freed by another thread)
+            if (cleanup_complete.load(std::memory_order_acquire) || !m_bev) {
+                bufferevent_unlock(m_bev);
+                log_debug("sendData: object is being destroyed (checked after lock), ignoring");
+                return false;
+            }
 
-        evbuffer* output = bufferevent_get_output(m_bev);
-        if (!output) {
+            evbuffer* output = bufferevent_get_output(m_bev);
+            if (!output) {
+                bufferevent_unlock(m_bev);
+                return false;
+            }
+
+            send(output, data, length, type);
+
+            bufferevent_unlock(m_bev);
+
+            return true;
+        } catch (const std::exception& e) {
+            log_error("Exception in sendData when locking bufferevent: %s", e.what());
+            // Try to unlock if we locked it
+            if (m_bev) {
+                try {
+                    bufferevent_unlock(m_bev);
+                } catch (...) {
+                    // Ignore unlock errors
+                }
+            }
+            return false;
+        } catch (...) {
+            log_error("Unknown exception in sendData when locking bufferevent");
+            // Try to unlock if we locked it
+            if (m_bev) {
+                try {
+                    bufferevent_unlock(m_bev);
+                } catch (...) {
+                    // Ignore unlock errors
+                }
+            }
             return false;
         }
-
-        send(output, data, length, type);
-
-        bufferevent_unlock(m_bev);
-
-        return true;
     }
 
     log_error("Cannot send in state %d", int(state));
@@ -713,6 +764,17 @@ void WebSocketClient::send(evbuffer* buf,
                          size_t raw_len,
                          MessageType type) 
 {
+    // Check if object is being destroyed
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("send: object is being destroyed, ignoring send request");
+        return;
+    }
+    
+    if (!buf) {
+        log_error("send: invalid evbuffer");
+        return;
+    }
+
     const bool is_control_frame = (type == MessageType::CLOSE || 
                                  type == MessageType::PING || 
                                  type == MessageType::PONG);
@@ -810,44 +872,57 @@ void WebSocketClient::send(evbuffer* buf,
 
     auto out = buf;
 
-    evbuffer_add(out, &b1, 1);
-    evbuffer_add(out, &b2, 1);
+    // Wrap evbuffer operations in try-catch to handle destroyed evbuffer
+    try {
+        // Double-check cleanup_complete before writing to evbuffer
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("send: object is being destroyed (checked before evbuffer_add), ignoring");
+            return;
+        }
 
-    // Extended payload length
-    if ((b2 & 0x7F) == 126) {
-        uint16_t len = htons(static_cast<uint16_t>(payload_len));
-        evbuffer_add(out, &len, 2);
-    } else if ((b2 & 0x7F) == 127) {
-        uint64_t len = htonll(static_cast<uint64_t>(payload_len));
-        evbuffer_add(out, &len, 8);
-    }
+        evbuffer_add(out, &b1, 1);
+        evbuffer_add(out, &b2, 1);
 
-    // Chunked masking implementation
-    uint8_t mask_key[4];
-    std::random_device rd;
-    std::uniform_int_distribution<uint8_t> distrib(0, 255);
-    for (int i = 0; i < 4; ++i) mask_key[i] = distrib(rd);
-    evbuffer_add(out, mask_key, 4);
+        // Extended payload length
+        if ((b2 & 0x7F) == 126) {
+            uint16_t len = htons(static_cast<uint16_t>(payload_len));
+            evbuffer_add(out, &len, 2);
+        } else if ((b2 & 0x7F) == 127) {
+            uint64_t len = htonll(static_cast<uint64_t>(payload_len));
+            evbuffer_add(out, &len, 8);
+        }
 
-    uint32_t mask_32;
-    memcpy(&mask_32, mask_key, 4);
-    
-    size_t i = 0;
-    const size_t aligned_len = payload_len & ~0x03;
-    const uint8_t* src = payload_ptr;
-    
-    // Process 32-bit chunks
-    for (; i < aligned_len; i += 4) {
-        uint32_t chunk;
-        memcpy(&chunk, src + i, 4);
-        chunk ^= mask_32;
-        evbuffer_add(out, &chunk, 4);
-    }
-    
-    // Process remaining bytes
-    for (; i < payload_len; ++i) {
-        uint8_t byte = src[i] ^ mask_key[i % 4];
-        evbuffer_add(out, &byte, 1);
+        // Chunked masking implementation
+        uint8_t mask_key[4];
+        std::random_device rd;
+        std::uniform_int_distribution<uint8_t> distrib(0, 255);
+        for (int i = 0; i < 4; ++i) mask_key[i] = distrib(rd);
+        evbuffer_add(out, mask_key, 4);
+
+        uint32_t mask_32;
+        memcpy(&mask_32, mask_key, 4);
+        
+        size_t i = 0;
+        const size_t aligned_len = payload_len & ~0x03;
+        const uint8_t* src = payload_ptr;
+        
+        // Process 32-bit chunks
+        for (; i < aligned_len; i += 4) {
+            uint32_t chunk;
+            memcpy(&chunk, src + i, 4);
+            chunk ^= mask_32;
+            evbuffer_add(out, &chunk, 4);
+        }
+        
+        // Process remaining bytes
+        for (; i < payload_len; ++i) {
+            uint8_t byte = src[i] ^ mask_key[i % 4];
+            evbuffer_add(out, &byte, 1);
+        }
+    } catch (const std::exception& e) {
+        log_error("Exception in send() when writing to evbuffer: %s", e.what());
+    } catch (...) {
+        log_error("Unknown exception in send() when writing to evbuffer");
     }
 }
 
