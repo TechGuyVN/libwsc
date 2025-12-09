@@ -254,6 +254,10 @@ void WebSocketClient::disconnect() {
                         [&]{ return got_remote_close.load(); });
     }
 
+    // Set cleanup_complete AFTER close() but BEFORE locking bufferevent
+    // This prevents sendData from locking bufferevent while we're disconnecting
+    cleanup_complete.store(true, std::memory_order_release);
+
     if (base && running.load()) {
         // Cancel timeout and ping events first to prevent callbacks from being called
         // This must be done before loopexit to ensure events are removed from event_base
@@ -266,20 +270,45 @@ void WebSocketClient::disconnect() {
             log_debug("Cancelled ping event");
         }
         
-        bufferevent_lock(m_bev);
-        bufferevent_disable(m_bev, EV_READ | EV_WRITE);
-        // schedule a zero-timeout no-op so the loop definitely wakes
-        struct timeval zero = {0,0};
-        event_base_once(base,
-                        /*fd*/-1,
-                        EV_TIMEOUT,
-                        /*cb*/ [](evutil_socket_t, short, void*) {
-                        log_debug("zero-timeout callback fired");
-                        },
-                        /*arg*/ nullptr,
-                        &zero);
-        event_base_loopexit(base, nullptr);
-        bufferevent_unlock(m_bev);
+        // Wrap bufferevent_lock in try-catch to handle destroyed bufferevent
+        if (m_bev) {
+            try {
+                bufferevent_lock(m_bev);
+                bufferevent_disable(m_bev, EV_READ | EV_WRITE);
+                // schedule a zero-timeout no-op so the loop definitely wakes
+                struct timeval zero = {0,0};
+                event_base_once(base,
+                                /*fd*/-1,
+                                EV_TIMEOUT,
+                                /*cb*/ [](evutil_socket_t, short, void*) {
+                                log_debug("zero-timeout callback fired");
+                                },
+                                /*arg*/ nullptr,
+                                &zero);
+                event_base_loopexit(base, nullptr);
+                bufferevent_unlock(m_bev);
+            } catch (const std::exception& e) {
+                log_error("Exception in disconnect() when locking bufferevent: %s", e.what());
+                // Try to unlock if we locked it
+                if (m_bev) {
+                    try {
+                        bufferevent_unlock(m_bev);
+                    } catch (...) {
+                        // Ignore unlock errors
+                    }
+                }
+            } catch (...) {
+                log_error("Unknown exception in disconnect() when locking bufferevent");
+                // Try to unlock if we locked it
+                if (m_bev) {
+                    try {
+                        bufferevent_unlock(m_bev);
+                    } catch (...) {
+                        // Ignore unlock errors
+                    }
+                }
+            }
+        }
     }
 
     auto self = this;
@@ -424,11 +453,24 @@ bool WebSocketClient::sendData(const void* data,
             return false;
         }
         
+        // CRITICAL: Check cleanup_complete BEFORE attempting to lock bufferevent
+        // This prevents deadlock when disconnect() is freeing bufferevent
+        if (cleanup_complete.load(std::memory_order_acquire)) {
+            log_debug("sendData: object is being destroyed (checked before lock), ignoring");
+            return false;
+        }
+        
+        // Double-check m_bev is still valid
+        if (!m_bev) {
+            log_debug("sendData: bufferevent is null, ignoring");
+            return false;
+        }
+        
         // Wrap bufferevent operations in try-catch to handle destroyed bufferevent
         try {
-            // Double-check cleanup_complete before locking bufferevent
+            // Final check before lock - another thread may have set cleanup_complete
             if (cleanup_complete.load(std::memory_order_acquire)) {
-                log_debug("sendData: object is being destroyed (checked before lock), ignoring");
+                log_debug("sendData: object is being destroyed (final check before lock), ignoring");
                 return false;
             }
             
