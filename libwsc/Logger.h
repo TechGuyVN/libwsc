@@ -1,6 +1,6 @@
 /*
  *  Logger.h
- *  Dual-mode logger: console or syslog
+ *  Dual-mode logger: FreeSWITCH, console or syslog
  * 
  *  Author: Milan M.
  *  Copyright (c) 2025 AMSOFTSWITCH LTD. All rights reserved.
@@ -15,6 +15,14 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <ctime>
+
+// Check if FreeSWITCH headers are available
+#ifdef SWITCH_LOG_DEBUG
+    #include <switch.h>
+    #define LIBWSC_USE_FREESWITCH_LOG 1
+#else
+    #define LIBWSC_USE_FREESWITCH_LOG 0
+#endif
 
 /**
  * \brief Determines if logs should go to syslog (non-interactive) or console.
@@ -45,10 +53,13 @@ inline void current_timestamp(char* buf, size_t len) {
 }
 
 /**
- * \brief Internal debug logger: writes to stdout or syslog.
+ * \brief Internal debug logger: writes to FreeSWITCH, stdout or syslog.
  */
 inline void log_debug_impl(const char* message) {
 #ifdef LIBWSC_USE_DEBUG
+#if LIBWSC_USE_FREESWITCH_LOG
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "mod_audio_stream[libwsc]: %s\n", message);
+#else
     char ts[32]; current_timestamp(ts, sizeof(ts));
     if (logger_use_syslog()) {
         syslog(LOG_DEBUG, "%s", message);
@@ -56,15 +67,19 @@ inline void log_debug_impl(const char* message) {
         fprintf(stdout, "[DEBUG %s] %s\n", ts, message);
         fflush(stdout);
     }
+#endif
 #else
     (void)message;
 #endif
 }
 
 /**
- * \brief Internal error logger: writes to stderr or syslog.
+ * \brief Internal error logger: writes to FreeSWITCH, stderr or syslog.
  */
 inline void log_error_impl(const char* message) {
+#if LIBWSC_USE_FREESWITCH_LOG
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_audio_stream[libwsc]: %s\n", message);
+#else
     char ts[32]; current_timestamp(ts, sizeof(ts));
     if (logger_use_syslog()) {
         syslog(LOG_ERR, "%s", message);
@@ -72,6 +87,7 @@ inline void log_error_impl(const char* message) {
         fprintf(stderr, "[ERROR %s] %s\n", ts, message);
         fflush(stderr);
     }
+#endif
 }
 
 // Zero-arg overloads to avoid format-security warnings
