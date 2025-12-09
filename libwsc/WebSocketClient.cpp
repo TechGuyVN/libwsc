@@ -254,12 +254,13 @@ void WebSocketClient::disconnect() {
                         [&]{ return got_remote_close.load(); });
     }
 
-    // Set cleanup_complete AFTER close() but BEFORE locking bufferevent
-    // This prevents sendData from locking bufferevent while we're disconnecting
+    // Set cleanup_complete EARLY to prevent callbacks from accessing destroyed resources
+    // This must be done BEFORE canceling events to ensure callbacks see the flag
     cleanup_complete.store(true, std::memory_order_release);
 
     if (base && running.load()) {
-        // Cancel timeout and ping events first to prevent callbacks from being called
+        // Cancel timeout and ping events AFTER setting cleanup_complete
+        // This ensures any callback that runs will see cleanup_complete=true and exit early
         // This must be done before loopexit to ensure events are removed from event_base
         if (timeout_event) {
             event_del(timeout_event);
@@ -593,23 +594,32 @@ void WebSocketClient::setOpenCallback(OpenCallback callback) {
 
 // Invoke the error callback (or log if none set)
 void WebSocketClient::sendError(int error_code, const std::string& error_message) {
-    // Check if object is being destroyed to prevent use-after-free
+    // CRITICAL: Check cleanup_complete FIRST before any operations
+    // This prevents accessing destroyed mutex or callbacks
     if (cleanup_complete.load(std::memory_order_acquire)) {
         log_debug("sendError: object is being destroyed, ignoring error: %s", error_message.c_str());
         return;
     }
 
     ErrorCallback callback;
-    try {
-        std::lock_guard<std::mutex> lock(callback_mutex);
-        callback = error_callback;
-    } catch (const std::exception& e) {
-        log_error("Exception locking callback_mutex in sendError: %s", e.what());
-        return;
-    } catch (...) {
-        log_error("Unknown exception locking callback_mutex in sendError");
+    
+    // Use try_lock to avoid blocking if mutex is being destroyed
+    // If we can't lock immediately, skip the callback
+    std::unique_lock<std::mutex> lock(callback_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // Could not acquire lock - object may be being destroyed
+        log_debug("sendError: could not acquire callback_mutex lock, ignoring error");
         return;
     }
+    
+    // Double-check cleanup_complete after acquiring lock
+    if (cleanup_complete.load(std::memory_order_acquire)) {
+        log_debug("sendError: object is being destroyed (checked after lock), ignoring error");
+        return;
+    }
+    
+    callback = error_callback;
+    lock.unlock(); // Release lock before calling callback to avoid deadlock
 
     if (callback) {
         try {
